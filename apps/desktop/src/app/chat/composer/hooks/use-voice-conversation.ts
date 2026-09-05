@@ -480,7 +480,7 @@ export function useVoiceConversation({
     }
 
     stopBargeMonitorRef.current = monitorSpeechDuringPlayback({
-      isPlaying: () => $voicePlayback.get().status === 'speaking',
+      isPlaying: () => ['speaking', 'paused'].includes($voicePlayback.get().status),
       thresholdMultiplier: $bargeInThresholdMultiplier.get(),
       onSpeech: () => {
         // Snapshot before playback is cut: the reply may be consumed by the
