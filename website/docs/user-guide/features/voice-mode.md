@@ -206,6 +206,8 @@ Client-direct wire support: OpenAI (incl. Nous-managed audio), Groq, Mistral, an
 
 While Hermes Desktop reads aloud or speaks a voice reply, use the pause button beside **Stop playback** to hold your place. The button becomes Resume while paused. Resuming continues the same audio; Stop playback discards it. An intentional pause does not count as stalled audio.
 
+In continuous voice mode with barge-in enabled, the microphone remains active while playback is paused. Speaking interrupts and discards the held reply so you can give a new instruction, just as it does during playback.
+
 ### Desktop: GPT-Live voice chat mode (full duplex, delegates to Hermes)
 
 The chained loop above is one of two voice chat modes in the desktop app. The other replaces the whole STT → turn → TTS chain with **one full-duplex voice model**, OpenAI's `gpt-live-1`: it listens while it speaks, handles interruptions, backchannels and background noise itself, and has **no tools of its own**. Whenever you ask for real work it *delegates* to Hermes, which answers as usual — with whatever model and provider the session has selected, the full toolset, memory and approvals — and the voice paraphrases the answer aloud.
