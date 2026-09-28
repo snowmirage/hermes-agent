@@ -2,6 +2,7 @@ import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { BargeMonitorCallbacks } from '@/lib/voice-barge-in'
+import { $voicePlayback } from '@/store/voice-playback'
 
 import type { MicRecording } from './use-mic-recorder'
 import { speechResumeOffset, useVoiceConversation } from './use-voice-conversation'
@@ -26,13 +27,15 @@ vi.mock('@/lib/voice-barge-in', () => ({
 
 const markVoicePlaybackInterrupted = vi.fn()
 const stopVoicePlayback = vi.fn()
+const takeVoicePlaybackInterrupted = vi.fn(() => true)
 const startSpeechStreamMock = vi.fn(async () => null)
 
 vi.mock('@/lib/voice-playback', () => ({
   markVoicePlaybackInterrupted: () => markVoicePlaybackInterrupted(),
   playSpeechText: vi.fn(async () => true),
   startSpeechStream: (...args: unknown[]) => startSpeechStreamMock(...(args as [])),
-  stopVoicePlayback: () => stopVoicePlayback()
+  stopVoicePlayback: () => stopVoicePlayback(),
+  takeVoicePlaybackInterrupted: () => takeVoicePlaybackInterrupted()
 }))
 
 vi.mock('@/lib/thinking-sound', () => ({
@@ -455,5 +458,92 @@ describe('useVoiceConversation parks an undeliverable barge transcript (#123357)
     expect(submitted).toEqual(['kick off the task'])
 
     vi.useRealTimers()
+  })
+})
+
+// #126708 — over speakers the reply bleeds into the mic and trips the
+// playback-phase barge. The CLI drops a capture that matches what it was
+// speaking (tools/voice_mode_transcript.is_tts_echo); the desktop loop must
+// too, instead of submitting Hermes' own words as an "interrupting" user turn.
+describe('useVoiceConversation TTS echo guard (#126708)', () => {
+  const spokenReply =
+    "Sure, here's a summary of what we found. The build failed because of a missing dependency in the " +
+    "lockfile. I've already gone ahead and regenerated it, and the tests are passing again locally."
+
+  let replyReady: boolean
+
+  beforeEach(() => {
+    replyReady = false
+    monitorCalls.length = 0
+    vi.clearAllMocks()
+    micHandle.start.mockResolvedValue(undefined)
+    micHandle.stop.mockResolvedValue(null)
+  })
+
+  afterEach(() => {
+    $voicePlayback.set({ ...$voicePlayback.get(), status: 'idle' })
+    cleanup()
+  })
+
+  /** Barge while `spokenReply` is (or is not) audibly playing, then deliver the capture. */
+  const bargeWith = async (transcript: string, { playing }: { playing: boolean }) => {
+    const convo = renderConversation({
+      pendingResponse: () => (replyReady ? { id: 'reply-1', pending: false, text: spokenReply } : null),
+      transcript
+    })
+
+    await act(async () => {
+      await convo.hook.result.current.start()
+    })
+    await enterThinking(convo.hook)
+    await waitFor(() => expect(monitorCalls.length).toBeGreaterThan(0))
+
+    const monitor = monitorCalls.at(-1)
+
+    replyReady = true
+    $voicePlayback.set({ ...$voicePlayback.get(), status: playing ? 'speaking' : 'idle' })
+
+    act(() => {
+      monitor?.onSpeech()
+    })
+    // The barged reply is consumed (settleAfterSpeech) and the turn ends.
+    replyReady = false
+    convo.hook.rerender({ busy: false })
+
+    const startsBefore = micHandle.start.mock.calls.length
+
+    await act(async () => {
+      monitor?.onUtterance?.(new Blob(['e'], { type: 'audio/webm' }))
+    })
+    await waitFor(() => expect(convo.onTranscribeAudio).toHaveBeenCalledTimes(2))
+
+    return { ...convo, startsBefore }
+  }
+
+  it('drops a playback-phase capture that is a fragment of the reply being spoken', async () => {
+    const { onSubmit, startsBefore } = await bargeWith('the build failed because of a missing dependency', {
+      playing: true
+    })
+
+    // The mic re-arms for a real turn…
+    await waitFor(() => expect(micHandle.start.mock.calls.length).toBeGreaterThan(startsBefore))
+    // …and only the kickoff turn was ever submitted.
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+    expect(onSubmit).not.toHaveBeenCalledWith('the build failed because of a missing dependency')
+    // The "user interrupted" latch is cleared so a later genuine turn isn't annotated.
+    expect(takeVoicePlaybackInterrupted).toHaveBeenCalledTimes(1)
+  })
+
+  it('still submits a genuine interjection captured during playback', async () => {
+    const { onSubmit } = await bargeWith('actually can you also check my calendar for tomorrow', { playing: true })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith('actually can you also check my calendar for tomorrow'))
+    expect(takeVoicePlaybackInterrupted).not.toHaveBeenCalled()
+  })
+
+  it('does not apply the guard to a generation-phase trip (nothing audible to echo)', async () => {
+    const { onSubmit } = await bargeWith('the build failed because of a missing dependency', { playing: false })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith('the build failed because of a missing dependency'))
   })
 })
