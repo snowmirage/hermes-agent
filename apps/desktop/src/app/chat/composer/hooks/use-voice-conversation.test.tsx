@@ -26,11 +26,12 @@ vi.mock('@/lib/voice-barge-in', () => ({
 
 const markVoicePlaybackInterrupted = vi.fn()
 const stopVoicePlayback = vi.fn()
+const startSpeechStreamMock = vi.fn(async () => null)
 
 vi.mock('@/lib/voice-playback', () => ({
   markVoicePlaybackInterrupted: () => markVoicePlaybackInterrupted(),
   playSpeechText: vi.fn(async () => true),
-  startSpeechStream: vi.fn(async () => null),
+  startSpeechStream: (...args: unknown[]) => startSpeechStreamMock(...(args as [])),
   stopVoicePlayback: () => stopVoicePlayback()
 }))
 
@@ -75,7 +76,13 @@ interface HookProps {
   busy: boolean
 }
 
-function renderConversation(overrides: { onInterrupt?: () => void; transcript?: string } = {}) {
+function renderConversation(
+  overrides: {
+    onInterrupt?: () => void
+    pendingResponse?: () => { id: string; pending: boolean; text: string; turnKey?: string } | null
+    transcript?: string
+  } = {}
+) {
   const onInterrupt = overrides.onInterrupt ?? vi.fn()
 
   // Mirrors the real app: submitting a turn makes the agent busy.
@@ -95,6 +102,8 @@ function renderConversation(overrides: { onInterrupt?: () => void; transcript?: 
     transcriptions++ === 0 ? 'kick off the task' : (overrides.transcript ?? 'and another thing')
   )
 
+  const pendingResponse = overrides.pendingResponse ?? (() => null)
+
   const hook = renderHook(
     ({ busy }: HookProps) =>
       useVoiceConversation({
@@ -105,14 +114,14 @@ function renderConversation(overrides: { onInterrupt?: () => void; transcript?: 
         onStopWord,
         onSubmit,
         onTranscribeAudio,
-        pendingResponse: () => null
+        pendingResponse
       }),
     { initialProps: { busy: false } }
   )
 
   onBusyChange.current = busy => hook.rerender({ busy })
 
-  return { hook, onInterrupt, onStopWord, onSubmit, onTranscribeAudio }
+  return { hook, onInterrupt, onBusyChange, onStopWord, onSubmit, onTranscribeAudio }
 }
 
 /** Drive the hook into the generation phase (turn submitted, model working). */
@@ -155,6 +164,40 @@ describe('useVoiceConversation full-duplex barge-in', () => {
     await waitFor(() => expect(hook.result.current.status).toBe('thinking'))
     // busy=true + thinking → the full-duplex monitor must be live.
     await waitFor(() => expect(monitorCalls.length).toBeGreaterThan(0))
+  })
+
+  it('keeps feeding the same speech session after hydration rewrites the reply id', async () => {
+    let response: { id: string; pending: boolean; text: string; turnKey: string } | null = null
+    const append = vi.fn()
+    const finish = vi.fn()
+    const session = {
+      append,
+      done: new Promise<'completed'>(() => undefined),
+      finish
+    }
+    startSpeechStreamMock.mockResolvedValueOnce(session as never)
+
+    const { hook, onBusyChange } = renderConversation({ pendingResponse: () => response })
+
+    await act(async () => {
+      await hook.result.current.start()
+    })
+    await enterThinking(hook)
+
+    response = { id: 'assistant-stream-1', pending: true, text: 'One.', turnKey: 'session:0' }
+    act(() => {
+      onBusyChange.current(false)
+      onBusyChange.current(true)
+    })
+    await waitFor(() => expect(append).toHaveBeenCalledWith('One.'))
+
+    response = { id: 'durable-42', pending: true, text: 'One. Two. Three.', turnKey: 'session:0' }
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 200))
+    })
+
+    expect(append).toHaveBeenCalledWith(' Two. Three.')
+    expect(finish).not.toHaveBeenCalled()
   })
 
   it('interrupts the in-flight turn when speech trips mid-generation', async () => {
