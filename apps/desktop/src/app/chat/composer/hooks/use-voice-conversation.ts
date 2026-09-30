@@ -23,6 +23,7 @@ export type ConversationStatus = 'idle' | 'listening' | 'transcribing' | 'thinki
 
 interface PendingVoiceResponse {
   id: string
+  turnKey: string
   pending: boolean
   text: string
 }
@@ -76,6 +77,7 @@ export function useVoiceConversation({
   const turnClosingRef = useRef(false)
   const awaitingSpokenResponseRef = useRef(false)
   const responseIdRef = useRef<string | null>(null)
+  const responseTurnKeyRef = useRef<string | null>(null)
   const spokenSourceLengthRef = useRef(0)
   const speechSessionRef = useRef<null | SpeechStreamSession>(null)
   const stopBargeMonitorRef = useRef<(() => void) | null>(null)
@@ -141,6 +143,7 @@ export function useVoiceConversation({
     bargedRef.current = false
     speechSessionRef.current = null
     responseIdRef.current = null
+    responseTurnKeyRef.current = null
     spokenSourceLengthRef.current = 0
   }
 
@@ -417,16 +420,16 @@ export function useVoiceConversation({
 
   /** Push any new reply text into the live session; finish when complete. */
   const feedSpeechSession = useCallback(
-    (responseId: string) => {
+    (responseId: string, responseTurnKey: string) => {
       const session = speechSessionRef.current
 
-      if (!session || responseIdRef.current !== responseId) {
+      if (!session || responseIdRef.current !== responseId || responseTurnKeyRef.current !== responseTurnKey) {
         return
       }
 
       const response = pendingResponse()
 
-      if (response && response.id === responseId) {
+      if (response && response.turnKey === responseTurnKey) {
         if (response.text.length > spokenSourceLengthRef.current) {
           session.append(response.text.slice(spokenSourceLengthRef.current))
           spokenSourceLengthRef.current = response.text.length
@@ -502,10 +505,11 @@ export function useVoiceConversation({
    * — no wait for the full reply, no per-sentence gaps.
    */
   const openLiveSpeech = useCallback(
-    (responseId: string) => {
+    (responseId: string, responseTurnKey: string) => {
       const sequenceBeforeStart = $voicePlayback.get().sequence
 
       responseIdRef.current = responseId
+      responseTurnKeyRef.current = responseTurnKey
       spokenSourceLengthRef.current = 0
       setStatus('speaking')
 
@@ -565,8 +569,8 @@ export function useVoiceConversation({
 
         // Timer-driven feed: reply text flows into the session at delta rate
         // regardless of React render cadence.
-        const feedTimer = window.setInterval(() => feedSpeechSession(responseId), 150)
-        feedSpeechSession(responseId)
+        const feedTimer = window.setInterval(() => feedSpeechSession(responseId, responseTurnKey), 150)
+        feedSpeechSession(responseId, responseTurnKey)
 
         const outcome = await session.done
         window.clearInterval(feedTimer)
@@ -709,7 +713,7 @@ export function useVoiceConversation({
       const response = pendingResponse()
 
       if (response) {
-        openLiveSpeech(response.id)
+        openLiveSpeech(response.id, response.turnKey)
 
         return
       }
