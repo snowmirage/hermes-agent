@@ -435,7 +435,7 @@ export function useVoiceConversation({
         resumeListening()
       }
     },
-    [consumePendingResponse, onTranscribeAudio, voiceCopy.transcriptionFailed]
+    [consumePendingResponse, focusInput, onTranscribeAudio, parkText, voiceCopy.transcriptionFailed]
   )
 
   /**
