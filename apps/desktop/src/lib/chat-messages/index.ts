@@ -3,6 +3,7 @@ export {
   appendAssistantTextPart,
   appendReasoningPart,
   assistantTextPart,
+  chatMessageSpeechText,
   chatMessageText,
   collectUnspokenTurnSpeech,
   completeOpenTimelineParts,
