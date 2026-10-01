@@ -212,7 +212,11 @@ export function collectUnspokenTurnSpeech(
       continue
     }
 
-    const text = chatMessageText(message).trim()
+    // Speech text, not display text: once hydration folds the turn into one
+    // row, its narration and answer are separated only by tool parts, and
+    // joined with nothing they would read as one sentence — and the folded
+    // string would no longer line up with the live bubbles already spoken.
+    const text = chatMessageSpeechText(message).trim()
 
     if (!text) {
       continue
