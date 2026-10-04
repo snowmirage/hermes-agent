@@ -49,7 +49,7 @@ const ADDRESS_PREFIXES: readonly string[] = ['hey hermes', 'hey hermes,', 'herme
 // ("стоп!", "«отбой»", "停止。"), collapse whitespace. Transcripts and
 // configured phrases go through the same function, so the match stays exact —
 // like the backend's `is_voice_stop_phrase` — just punctuation-insensitive.
-function normalize(text: string): string {
+export function normalize(text: string): string {
   return text
     .normalize('NFKC')
     .toLowerCase()
@@ -58,7 +58,7 @@ function normalize(text: string): string {
     .trim()
 }
 
-function stripAddress(text: string): string {
+export function stripAddress(text: string): string {
   for (const prefix of ADDRESS_PREFIXES) {
     if (text === prefix) {
       // Bare address ("hermes") is not a stop command on its own.

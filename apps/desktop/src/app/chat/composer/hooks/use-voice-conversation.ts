@@ -3,9 +3,12 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useI18n } from '@/i18n'
 import { startThinkingSound, stopThinkingSound } from '@/lib/thinking-sound'
 import { monitorSpeechDuringPlayback } from '@/lib/voice-barge-in'
+import { isVoiceHoldCommand, isVoiceResumeCommand } from '@/lib/voice-hold-word'
 import {
   markVoicePlaybackInterrupted,
+  pauseVoicePlayback,
   playSpeechText,
+  resumeVoicePlayback,
   type SpeechStreamSession,
   startSpeechStream,
   stopVoicePlayback,
@@ -118,6 +121,8 @@ export function useVoiceConversation({
   const stopBargeMonitorRef = useRef<(() => void) | null>(null)
   const bargeCapturePendingRef = useRef(false)
   const bargedRef = useRef(false)
+  // The user said "hold on": the reply's speech stays paused until "go on".
+  const heldRef = useRef(false)
   // Reply text that was playing when the barge tripped ('' for a
   // generation-phase trip: nothing audible, so nothing to echo).
   const bargeEchoTextRef = useRef('')
@@ -190,6 +195,7 @@ export function useVoiceConversation({
     stopBargeMonitorRef.current = null
     bargeCapturePendingRef.current = false
     bargedRef.current = false
+    heldRef.current = false
     bargeEchoTextRef.current = ''
     speechSessionRef.current = null
     responseIdRef.current = null
@@ -366,16 +372,30 @@ export function useVoiceConversation({
     [consumePendingResponse]
   )
 
+  /** Re-arms barge-in from inside the utterance handler (declared below it). */
+  const ensureBargeMonitorRef = useRef<() => void>(() => undefined)
+
   /**
-   * Submit the utterance the barge monitor captured — the user's interruption
-   * from its first syllable, no re-listen round trip. Empty/failed captures
-   * fall back to normal listening.
+   * Act on the utterance the barge monitor captured — the user's interruption
+   * from its first syllable, no re-listen round trip. Barge-in only *paused*
+   * the reply; what was said decides the rest:
+   *
+   * - nothing usable (a cough, an empty transcript, Hermes hearing its own
+   *   reply): resume, unless held;
+   * - "hold on": keep the reply paused (generation carries on behind it) and
+   *   listen for "go on";
+   * - "go on": resume the reply where it paused;
+   * - a stop word: stop the reply and the turn, end the conversation;
+   * - anything else: a real interruption — discard the reply, cut the turn,
+   *   and submit what was said as the next one.
    */
   const submitCapturedUtterance = useCallback(
     async (audio: Blob | null) => {
       const echoSource = bargeEchoTextRef.current
 
       bargeEchoTextRef.current = ''
+
+      const replyInProgress = () => responseIdRef.current !== null || awaitingSpokenResponseRef.current
 
       const resumeListening = () => {
         if (enabledRef.current && !mutedRef.current) {
@@ -385,27 +405,76 @@ export function useVoiceConversation({
         setStatus('idle')
       }
 
-      if (!audio || !onTranscribeAudio) {
-        resumeListening()
+      // The reply was not interrupted after all: keep it, and keep listening
+      // over it for the next utterance.
+      const keepReply = (resume: boolean) => {
+        bargedRef.current = false
 
-        return
-      }
-
-      setStatus('transcribing')
-
-      try {
-        const transcript = (await onTranscribeAudio(audio)).trim()
-
-        if (!transcript) {
+        if (!replyInProgress()) {
+          heldRef.current = false
           resumeListening()
 
           return
         }
 
-        // A spoken stop command while barging means "stop everything" — the
-        // turn/playback was already cut at trip time; now end the conversation
-        // instead of submitting "stop" as a new prompt.
+        setStatus(responseIdRef.current !== null ? 'speaking' : 'thinking')
+        ensureBargeMonitorRef.current()
+
+        if (resume) {
+          void resumeVoicePlayback()
+        }
+      }
+
+      if (!audio || !onTranscribeAudio) {
+        keepReply(!heldRef.current)
+
+        return
+      }
+
+      // While a reply is held or paused, the loop stays in `speaking`: the
+      // turn-drive effect would otherwise open a second speech session over
+      // the paused one.
+      if (!replyInProgress()) {
+        setStatus('transcribing')
+      }
+
+      try {
+        const transcript = (await onTranscribeAudio(audio)).trim()
+
+        if (!transcript) {
+          keepReply(!heldRef.current)
+
+          return
+        }
+
+        // Before the echo guard: a reply that says "hold on" must not make
+        // the user's own "hold on" read as Hermes hearing itself. A bleed
+        // fragment is never exactly a whole hold phrase.
+        if (isVoiceHoldCommand(transcript)) {
+          heldRef.current = true
+          keepReply(false)
+
+          return
+        }
+
+        if (isVoiceResumeCommand(transcript) && (heldRef.current || $voicePlayback.get().status === 'paused')) {
+          heldRef.current = false
+          keepReply(true)
+
+          return
+        }
+
+        heldRef.current = false
+
+        // A spoken stop command means "stop everything": the reply, the turn
+        // still generating, and the conversation — not a new prompt.
         if (isVoiceStopCommand(transcript)) {
+          stopVoicePlayback()
+
+          if (busyRef.current) {
+            void onInterruptRef.current?.()
+          }
+
           dropSpeechSession()
           setStatus('idle')
           onStopWordRef.current?.()
@@ -416,17 +485,26 @@ export function useVoiceConversation({
         // Fail-closed echo guard (tools/voice_mode_transcript.is_tts_echo):
         // over speakers the reply bleeds into the mic and trips the playback-
         // phase trigger. A transcript matching what was being spoken is
-        // Hermes hearing itself — treat it as silence: no submit, and clear
-        // the interruption latch so a later real turn isn't annotated.
+        // Hermes hearing itself — treat it as silence, and clear the
+        // interruption latch so a later real turn isn't annotated.
         if (echoSource && isTtsEcho(transcript, echoSource)) {
           takeVoicePlaybackInterrupted()
-          resumeListening()
+          keepReply(!heldRef.current)
 
           return
         }
 
-        // A generation-phase barge interrupted the in-flight turn; the submit
-        // path refuses while `busy`, so wait for the interrupt to settle.
+        // A real interruption: cut the reply and, mid-generation, the turn, so
+        // the captured utterance becomes the next one instead of queueing
+        // behind a stale reply.
+        markVoicePlaybackInterrupted()
+        stopVoicePlayback()
+
+        if (busyRef.current) {
+          void onInterruptRef.current?.()
+        }
+
+        // The submit path refuses while `busy`, so wait for the interrupt to settle.
         const deadline = Date.now() + INTERRUPT_SETTLE_TIMEOUT_MS
 
         while (busyRef.current && Date.now() < deadline) {
@@ -439,6 +517,7 @@ export function useVoiceConversation({
         // editable, one Enter away from sending — and resume listening.
         // Never drop a transcribed turn without a trace (#123357).
         if (busyRef.current) {
+          dropSpeechSession()
           parkText?.(transcript)
           focusInput?.()
           resumeListening()
@@ -454,6 +533,8 @@ export function useVoiceConversation({
         setStatus('thinking')
       } catch (error) {
         notifyError(error, voiceCopy.transcriptionFailed)
+        heldRef.current = false
+        stopVoicePlayback()
         resumeListening()
       }
     },
@@ -462,20 +543,19 @@ export function useVoiceConversation({
 
   /**
    * Full-duplex barge-in monitor for the WHOLE agent turn: armed at submit,
-   * live through generation (thinking) AND playback (speaking).
+   * live through generation (thinking) AND playback (speaking or paused).
    *
-   * - generation phase (`busy`): speech interrupts the in-flight turn via
-   *   `onInterrupt` — the same seam as the Stop button — and cuts any TTS that
-   *   managed to start, so the stale reply never speaks.
-   * - playback phase: speech cuts playback and the captured interruption is
-   *   transcribed and submitted as the next turn.
+   * Speech *pauses* any playback at once and is captured until the user goes
+   * quiet; nothing is cut until the transcript says what they meant
+   * (`submitCapturedUtterance`). While the capture is open, and while a reply
+   * is held, speech that starts is paused as it starts.
    *
    * Idempotent — one monitor owns the mic per turn; re-arming while one is
    * live is a no-op (the live/fallback speech paths and the turn-drive effect
-   * all call this).
+   * all call this). Never armed while the microphone is muted.
    */
   const ensureBargeMonitor = useCallback(() => {
-    if (stopBargeMonitorRef.current) {
+    if (stopBargeMonitorRef.current || mutedRef.current) {
       return
     }
 
@@ -483,19 +563,12 @@ export function useVoiceConversation({
       isPlaying: () => ['speaking', 'paused'].includes($voicePlayback.get().status),
       thresholdMultiplier: $bargeInThresholdMultiplier.get(),
       onSpeech: () => {
-        // Snapshot before playback is cut: the reply may be consumed by the
-        // time the capture is transcribed.
+        // Snapshot what is being spoken, for the echo guard: the reply may be
+        // consumed by the time the capture is transcribed.
         bargeEchoTextRef.current = $voicePlayback.get().status === 'speaking' ? (pendingResponse()?.text ?? '') : ''
         bargeCapturePendingRef.current = true
         bargedRef.current = true
-        markVoicePlaybackInterrupted()
-        stopVoicePlayback()
-
-        if (busyRef.current) {
-          // Mid-generation: stop the in-flight turn so the captured utterance
-          // becomes the next one instead of queueing behind a stale reply.
-          void onInterruptRef.current?.()
-        }
+        void pauseVoicePlayback()
       },
       onUtterance: audio => {
         bargeCapturePendingRef.current = false
@@ -504,6 +577,20 @@ export function useVoiceConversation({
       }
     })
   }, [pendingResponse, submitCapturedUtterance])
+
+  ensureBargeMonitorRef.current = ensureBargeMonitor
+
+  // Speech that starts while the user is being heard out, or while the reply
+  // is held, is paused as it starts.
+  useEffect(
+    () =>
+      $voicePlayback.listen(playback => {
+        if (playback.status === 'speaking' && (heldRef.current || bargeCapturePendingRef.current)) {
+          void pauseVoicePlayback()
+        }
+      }),
+    []
+  )
 
   /** Push any new reply text into the live session; finish when complete. */
   const feedSpeechSession = useCallback(
@@ -731,11 +818,27 @@ export function useVoiceConversation({
   const toggleMute = useCallback(() => {
     setMuted(value => {
       const next = !value
+      const replyInProgress = responseIdRef.current !== null || awaitingSpokenResponseRef.current
+      mutedRef.current = next
 
       if (next) {
         clearTurnTimeout()
         handle.cancel()
-        setStatus('idle')
+
+        // Muted means barge-in is deaf too. A capture already under way is
+        // left to end at the next silence, so "hold on" then Mute still holds.
+        if (!bargeCapturePendingRef.current) {
+          stopBargeMonitorRef.current?.()
+          stopBargeMonitorRef.current = null
+        }
+
+        // A reply in progress (speaking, held, or still generating) keeps its
+        // status, or the turn-drive effect re-opens its speech on unmute.
+        if (!replyInProgress) {
+          setStatus('idle')
+        }
+      } else if (replyInProgress) {
+        ensureBargeMonitorRef.current()
       } else if (enabledRef.current && !busyRef.current && statusRef.current === 'idle') {
         pendingStartRef.current = true
       }

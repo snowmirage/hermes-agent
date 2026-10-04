@@ -27,12 +27,16 @@ vi.mock('@/lib/voice-barge-in', () => ({
 
 const markVoicePlaybackInterrupted = vi.fn()
 const stopVoicePlayback = vi.fn()
+const pauseVoicePlayback = vi.fn(async () => true)
+const resumeVoicePlayback = vi.fn(async () => true)
 const takeVoicePlaybackInterrupted = vi.fn(() => true)
 const startSpeechStreamMock = vi.fn(async () => null)
 
 vi.mock('@/lib/voice-playback', () => ({
   markVoicePlaybackInterrupted: () => markVoicePlaybackInterrupted(),
+  pauseVoicePlayback: () => pauseVoicePlayback(),
   playSpeechText: vi.fn(async () => true),
+  resumeVoicePlayback: () => resumeVoicePlayback(),
   startSpeechStream: (...args: unknown[]) => startSpeechStreamMock(...(args as [])),
   stopVoicePlayback: () => stopVoicePlayback(),
   takeVoicePlaybackInterrupted: () => takeVoicePlaybackInterrupted()
@@ -84,6 +88,8 @@ function renderConversation(
     onInterrupt?: () => void
     pendingResponse?: () => { id: string; pending: boolean; text: string; turnKey?: string } | null
     transcript?: string
+    /** What successive barge captures transcribe to; the last repeats. Overrides `transcript`. */
+    transcripts?: string[]
   } = {}
 ) {
   const onInterrupt = overrides.onInterrupt ?? vi.fn()
@@ -102,7 +108,11 @@ function renderConversation(
   let transcriptions = 0
 
   const onTranscribeAudio = vi.fn(async () =>
-    transcriptions++ === 0 ? 'kick off the task' : (overrides.transcript ?? 'and another thing')
+    transcriptions++ === 0
+      ? 'kick off the task'
+      : overrides.transcripts
+        ? overrides.transcripts[Math.min(transcriptions - 2, overrides.transcripts.length - 1)]
+        : (overrides.transcript ?? 'and another thing')
   )
 
   const pendingResponse = overrides.pendingResponse ?? (() => null)
@@ -262,7 +272,7 @@ describe('useVoiceConversation full-duplex barge-in', () => {
     expect(speechResumeOffset('', 'One.')).toBe(0)
   })
 
-  it('interrupts the in-flight turn when speech trips mid-generation', async () => {
+  it('pauses — never cuts — when speech trips mid-generation, until the transcript says why', async () => {
     const { hook, onInterrupt } = renderConversation()
 
     await act(async () => {
@@ -275,13 +285,14 @@ describe('useVoiceConversation full-duplex barge-in', () => {
       monitorCalls.at(-1)?.onSpeech()
     })
 
-    expect(onInterrupt).toHaveBeenCalledTimes(1)
-    expect(markVoicePlaybackInterrupted).toHaveBeenCalled()
-    expect(stopVoicePlayback).toHaveBeenCalled()
+    expect(pauseVoicePlayback).toHaveBeenCalled()
+    expect(onInterrupt).not.toHaveBeenCalled()
+    expect(markVoicePlaybackInterrupted).not.toHaveBeenCalled()
+    expect(stopVoicePlayback).not.toHaveBeenCalled()
   })
 
-  it('submits the captured interruption once the interrupt settles (busy clears)', async () => {
-    const { hook, onSubmit } = renderConversation({ transcript: 'no, do it differently' })
+  it('a real interruption cuts the turn and the reply, then submits once the interrupt settles', async () => {
+    const { hook, onInterrupt, onSubmit } = renderConversation({ transcripts: ['no, do it differently'] })
 
     await act(async () => {
       await hook.result.current.start()
@@ -295,18 +306,22 @@ describe('useVoiceConversation full-duplex barge-in', () => {
       monitor?.onSpeech()
     })
 
-    // Interrupt lands → the turn ends → busy flips false.
-    hook.rerender({ busy: false })
-
     await act(async () => {
       monitor?.onUtterance?.(new Blob(['x'], { type: 'audio/webm' }))
     })
 
+    await waitFor(() => expect(onInterrupt).toHaveBeenCalledTimes(1))
+    expect(markVoicePlaybackInterrupted).toHaveBeenCalled()
+    expect(stopVoicePlayback).toHaveBeenCalled()
+
+    // Interrupt lands → the turn ends → busy flips false.
+    hook.rerender({ busy: false })
+
     await waitFor(() => expect(onSubmit).toHaveBeenCalledWith('no, do it differently'))
   })
 
-  it('does not interrupt when speech trips during playback (turn already done)', async () => {
-    const { hook, onInterrupt } = renderConversation()
+  it('a real interruption during playback (turn already done) cuts the reply but has no turn to interrupt', async () => {
+    const { hook, onInterrupt, onSubmit } = renderConversation({ transcripts: ['and another thing'] })
 
     await act(async () => {
       await hook.result.current.start()
@@ -317,16 +332,24 @@ describe('useVoiceConversation full-duplex barge-in', () => {
     // Turn finished; playback phase.
     hook.rerender({ busy: false })
 
+    const monitor = monitorCalls.at(-1)
+
     act(() => {
-      monitorCalls.at(-1)?.onSpeech()
+      monitor?.onSpeech()
+    })
+    expect(stopVoicePlayback).not.toHaveBeenCalled()
+
+    await act(async () => {
+      monitor?.onUtterance?.(new Blob(['x'], { type: 'audio/webm' }))
     })
 
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith('and another thing'))
     expect(onInterrupt).not.toHaveBeenCalled()
     expect(stopVoicePlayback).toHaveBeenCalled()
   })
 
-  it('a spoken stop command in the barge capture ends the conversation instead of submitting', async () => {
-    const { hook, onStopWord, onSubmit } = renderConversation({ transcript: 'stop' })
+  it('a spoken stop command stops the reply and the turn, and ends the conversation instead of submitting', async () => {
+    const { hook, onInterrupt, onStopWord, onSubmit } = renderConversation({ transcripts: ['stop'] })
 
     await act(async () => {
       await hook.result.current.start()
@@ -339,16 +362,148 @@ describe('useVoiceConversation full-duplex barge-in', () => {
     act(() => {
       monitor?.onSpeech()
     })
-    hook.rerender({ busy: false })
 
     await act(async () => {
       monitor?.onUtterance?.(new Blob(['s'], { type: 'audio/webm' }))
     })
 
     await waitFor(() => expect(onStopWord).toHaveBeenCalledTimes(1))
+    expect(stopVoicePlayback).toHaveBeenCalled()
+    expect(onInterrupt).toHaveBeenCalledTimes(1)
     // Only the kickoff turn was submitted — the "stop" capture never was.
     expect(onSubmit).toHaveBeenCalledTimes(1)
     expect(onSubmit).not.toHaveBeenCalledWith('stop')
+  })
+
+  it('"hold on" keeps the reply paused and the turn running, and listens on for "go on"', async () => {
+    const { hook, onInterrupt, onSubmit } = renderConversation({ transcripts: ['Hold on a minute.', 'Go on.'] })
+
+    await act(async () => {
+      await hook.result.current.start()
+    })
+    await enterThinking(hook)
+    await waitFor(() => expect(monitorCalls.length).toBeGreaterThan(0))
+
+    const first = monitorCalls.at(-1)
+    const armed = monitorCalls.length
+
+    act(() => {
+      first?.onSpeech()
+    })
+
+    await act(async () => {
+      first?.onUtterance?.(new Blob(['h'], { type: 'audio/webm' }))
+    })
+
+    // Held: nothing cut, nothing sent, nothing resumed — and a fresh monitor hears the next words.
+    await waitFor(() => expect(monitorCalls.length).toBe(armed + 1))
+    expect(onInterrupt).not.toHaveBeenCalled()
+    expect(stopVoicePlayback).not.toHaveBeenCalled()
+    expect(resumeVoicePlayback).not.toHaveBeenCalled()
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+    expect(hook.result.current.status).toBe('thinking')
+
+    const second = monitorCalls.at(-1)
+
+    act(() => {
+      second?.onSpeech()
+    })
+
+    await act(async () => {
+      second?.onUtterance?.(new Blob(['g'], { type: 'audio/webm' }))
+    })
+
+    await waitFor(() => expect(resumeVoicePlayback).toHaveBeenCalledTimes(1))
+    expect(onInterrupt).not.toHaveBeenCalled()
+    expect(stopVoicePlayback).not.toHaveBeenCalled()
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+  })
+
+  it('a capture with no words (a cough) resumes the reply as if nothing happened', async () => {
+    const { hook, onInterrupt, onSubmit } = renderConversation({ transcripts: [''] })
+
+    await act(async () => {
+      await hook.result.current.start()
+    })
+    await enterThinking(hook)
+    await waitFor(() => expect(monitorCalls.length).toBeGreaterThan(0))
+
+    const monitor = monitorCalls.at(-1)
+
+    act(() => {
+      monitor?.onSpeech()
+    })
+
+    await act(async () => {
+      monitor?.onUtterance?.(new Blob(['c'], { type: 'audio/webm' }))
+    })
+
+    await waitFor(() => expect(resumeVoicePlayback).toHaveBeenCalledTimes(1))
+    expect(onInterrupt).not.toHaveBeenCalled()
+    expect(stopVoicePlayback).not.toHaveBeenCalled()
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+  })
+
+  it('Mute silences barge-in for the reply, and unmuting arms it again', async () => {
+    const { hook } = renderConversation()
+
+    await act(async () => {
+      await hook.result.current.start()
+    })
+    await enterThinking(hook)
+    await waitFor(() => expect(monitorCalls.length).toBeGreaterThan(0))
+
+    const armed = monitorCalls.length
+
+    act(() => {
+      hook.result.current.toggleMute()
+    })
+
+    expect(stopMonitor).toHaveBeenCalledTimes(1)
+    // The reply keeps its place in the loop.
+    expect(hook.result.current.status).toBe('thinking')
+
+    // Effect re-runs while muted must not open a mic.
+    hook.rerender({ busy: true })
+    expect(monitorCalls.length).toBe(armed)
+
+    act(() => {
+      hook.result.current.toggleMute()
+    })
+
+    expect(monitorCalls.length).toBe(armed + 1)
+  })
+
+  it('Mute during a capture lets the capture finish, so "hold on" then Mute still holds', async () => {
+    const { hook, onInterrupt } = renderConversation({ transcripts: ['hold on'] })
+
+    await act(async () => {
+      await hook.result.current.start()
+    })
+    await enterThinking(hook)
+    await waitFor(() => expect(monitorCalls.length).toBeGreaterThan(0))
+
+    const monitor = monitorCalls.at(-1)
+    const armed = monitorCalls.length
+
+    act(() => {
+      monitor?.onSpeech()
+    })
+    act(() => {
+      hook.result.current.toggleMute()
+    })
+
+    expect(stopMonitor).not.toHaveBeenCalled()
+
+    await act(async () => {
+      monitor?.onUtterance?.(new Blob(['h'], { type: 'audio/webm' }))
+    })
+
+    // Held, and — muted — no new monitor until unmute.
+    await waitFor(() => expect(hook.result.current.status).toBe('thinking'))
+    expect(monitorCalls.length).toBe(armed)
+    expect(resumeVoicePlayback).not.toHaveBeenCalled()
+    expect(onInterrupt).not.toHaveBeenCalled()
   })
 
   it('re-arms a single monitor per turn (idempotent ensure)', async () => {
@@ -520,13 +675,49 @@ describe('useVoiceConversation TTS echo guard (#126708)', () => {
     return { ...convo, startsBefore }
   }
 
+  it('holds on "hold on" even when the reply being spoken says "hold on" (#2648)', async () => {
+    const reply = 'If the build stalls, hold on a minute before you restart it. Then run the tests again.'
+    let ready = false
+
+    const convo = renderConversation({
+      pendingResponse: () => (ready ? { id: 'reply-1', pending: false, text: reply } : null),
+      transcript: 'hold on a minute'
+    })
+
+    await act(async () => {
+      await convo.hook.result.current.start()
+    })
+    await enterThinking(convo.hook)
+    await waitFor(() => expect(monitorCalls.length).toBeGreaterThan(0))
+
+    const monitor = monitorCalls.at(-1)
+    const armed = monitorCalls.length
+
+    ready = true
+    $voicePlayback.set({ ...$voicePlayback.get(), status: 'speaking' })
+
+    act(() => {
+      monitor?.onSpeech()
+    })
+
+    await act(async () => {
+      monitor?.onUtterance?.(new Blob(['h'], { type: 'audio/webm' }))
+    })
+
+    // Held — not dropped as Hermes hearing itself, which would resume it.
+    await waitFor(() => expect(monitorCalls.length).toBe(armed + 1))
+    expect(resumeVoicePlayback).not.toHaveBeenCalled()
+    expect(stopVoicePlayback).not.toHaveBeenCalled()
+    expect(convo.onSubmit).toHaveBeenCalledTimes(1)
+  })
+
   it('drops a playback-phase capture that is a fragment of the reply being spoken', async () => {
-    const { onSubmit, startsBefore } = await bargeWith('the build failed because of a missing dependency', {
+    const { onSubmit } = await bargeWith('the build failed because of a missing dependency', {
       playing: true
     })
 
-    // The mic re-arms for a real turn…
-    await waitFor(() => expect(micHandle.start.mock.calls.length).toBeGreaterThan(startsBefore))
+    // Barge-in only paused the reply (#2648): hearing itself, it resumes…
+    await waitFor(() => expect(resumeVoicePlayback).toHaveBeenCalledTimes(1))
     // …and only the kickoff turn was ever submitted.
     expect(onSubmit).toHaveBeenCalledTimes(1)
     expect(onSubmit).not.toHaveBeenCalledWith('the build failed because of a missing dependency')

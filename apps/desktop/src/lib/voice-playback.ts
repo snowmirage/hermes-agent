@@ -54,6 +54,28 @@ export async function toggleVoicePlaybackPaused(): Promise<void> {
   }
 }
 
+/** Pause the active playback in place. False when nothing is playing. */
+export async function pauseVoicePlayback(): Promise<boolean> {
+  if (!pauseControls || $voicePlayback.get().status !== 'speaking') {
+    return false
+  }
+
+  await toggleVoicePlaybackPaused()
+
+  return true
+}
+
+/** Resume a paused playback. False when nothing is paused. */
+export async function resumeVoicePlayback(): Promise<boolean> {
+  if (!pauseControls || $voicePlayback.get().status !== 'paused') {
+    return false
+  }
+
+  await toggleVoicePlaybackPaused()
+
+  return true
+}
+
 // A shared, lazily-created AudioContext used only to nudge the browser's
 // autoplay state out of "suspended". A wake-word-started voice turn has no
 // preceding user gesture, so the first HTMLAudioElement.play() can be rejected
@@ -350,7 +372,12 @@ function openClientDirectSpeechSession(tts: DirectTtsConfig, options: VoicePlayb
 
     producedAudio = true
     setVoicePlaybackState(currentState('speaking', options))
-    void audio.play().catch(failPlayback)
+
+    // A pause can land from the state change above (voice conversation holds
+    // new speech while it hears the user out); play only if none did.
+    if (!paused) {
+      void audio.play().catch(failPlayback)
+    }
 
     // The current segment is now playing, so use that time to prepare exactly
     // one following segment. Playback remains strictly FIFO.

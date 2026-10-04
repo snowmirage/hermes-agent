@@ -206,7 +206,15 @@ Client-direct wire support: OpenAI (incl. Nous-managed audio), Groq, Mistral, an
 
 While Hermes Desktop reads aloud or speaks a voice reply, use the pause button beside **Stop playback** to hold your place. The button becomes Resume while paused. Resuming continues the same audio; Stop playback discards it. An intentional pause does not count as stalled audio.
 
-In continuous voice mode with barge-in enabled, the microphone remains active while playback is paused. Speaking interrupts and discards the held reply so you can give a new instruction, just as it does during playback.
+In continuous voice mode you can do the same by voice. Speaking over a reply pauses it while Hermes hears you out, then:
+
+- **"Hold on"** (also "hang on", "wait", "one moment") keeps the reply paused. The turn keeps working behind it, and the microphone keeps listening.
+- **"Go on"** (also "go ahead", "carry on", "continue") resumes it where it paused.
+- **A stop word** stops the reply and the turn, and ends the conversation.
+- **Anything else** is a new instruction: the reply is discarded and what you said becomes the next turn.
+- A cough or noise with no words resumes the reply.
+
+The microphone **Mute** button silences this too, so you can hold a reply, mute to talk to someone else, then unmute and say "go on".
 
 ### Desktop: GPT-Live voice chat mode (full duplex, delegates to Hermes)
 
